@@ -105,6 +105,12 @@ func (client *Client) terminateCalls(err error) {
 	}
 }
 
+// Call()是对Go()的一个封装，阻塞在call.Done这等待响应返回，是个同步接口
+func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
+	return call.Error
+}
+
 // Go()和Call()是客户端暴露给用户的两个RPC服务调用接口
 // Go()是个异步接口
 func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
@@ -125,13 +131,9 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 	return call
 }
 
-// Call()是对Go()的一个封装，阻塞在call.Done这等待响应返回，是个同步接口
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
-}
-
 func (client *Client) send(call *Call) {
+	// 请求的报文必须是逐个发送的，并发容易导致多个请求报文交织在一起，服务端无法正确解析
+	// 在这里使用锁(sending)保证
 	client.sending.Lock()
 	defer client.sending.Unlock()
 
@@ -190,6 +192,7 @@ func (client *Client) receive() {
 }
 
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
+	// 根据CodecType获取对应的NewCodecFunc函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
@@ -198,12 +201,16 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	}
 
 	// 先进行协议的交换，即发送 Option 信息给服务端
+	// 正如设计的一样，客户端固定采用JSON编码Option，后续的 header 和 body 的编码方式由 Option 中的 CodeType 指定
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
 		log.Println("rpc client: options error: ", err)
 		_ = conn.Close()
 		return nil, err
 	}
-	return newClientCodec(f(conn), opt), nil
+
+	// 调用NewCodecFunc函数得到对应的实现了Codec接口的实例
+	cc := f(conn)
+	return newClientCodec(cc, opt), nil
 }
 
 func newClientCodec(cc codec.Codec, opt *Option) *Client {

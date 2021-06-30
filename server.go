@@ -3,11 +3,12 @@ package wangRPC
 import (
 	"7go/wangRPC/codec"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -29,13 +30,49 @@ var DefaultOption = &Option{
 
 
 
-type Server struct {}
+type Server struct {
+	serviceMap sync.Map
+}
+
+var DefaultServer = NewServer()
 
 func NewServer() *Server {
 	return &Server{}
 }
 
-var DefaultServer = NewServer()
+func Register(receiver interface{}) error {
+	return DefaultServer.Register(receiver)
+}
+
+func (s *Server) Register(receiver interface{}) error {
+	s2 := newService(receiver)
+	_, dup := s.serviceMap.LoadOrStore(s2.name, s2)
+	if dup {
+		return errors.New("rpc: service already defined: " + s2.name)
+	}
+	return nil
+}
+
+func (s *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
 
 func (s *Server) Accept(lis net.Listener) {
 	for {
@@ -85,9 +122,12 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 
 var invalidRequest = struct {}{}
 
+// request stores all information of a call
 type request struct {
 	h            *codec.Header  // header of request
 	argv, replyv reflect.Value  // argv and replyv of request
+	mtype        *methodType
+	svc          *service
 }
 
 func (s *Server) serveCodec(cc codec.Codec) {
@@ -130,19 +170,32 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 
 	req := &request{h: h}
-
-	// todo: now we don't know the type of request argv
-	// now, just support it's string
-
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv error: ", err)
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
 	}
+
+	req.argv   = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body error: ", err)
+		return req, err
+	}
+
+	log.Println("argvi")
+	log.Println(argvi)
+	//log.Println(req)
+	log.Println(req.argv)
 	return req, nil
 }
 
 func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
-	// 处理请求是并发的，但是回复请求的报文必须是逐个发送的，并发容易导致多个回复报文交织在一起，客户端无法解析
+	// 处理请求是并发的，但是回复请求的报文必须是逐个发送的，并发容易导致多个回复报文交织在一起，客户端无法正确解析
 	// 在这里使用锁(sending)保证
 	sending.Lock()
 	defer sending.Unlock()
@@ -154,8 +207,13 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 
 func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println("rpc server: ", req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("wangrpc resp %d", req.h.Seq))
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
+
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 

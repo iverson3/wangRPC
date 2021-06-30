@@ -2,14 +2,26 @@ package main
 
 import (
 	"7go/wangRPC"
-	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
 )
 
+type Foo int
+
+type Args struct {
+	Num1 int
+	Num2 int
+}
+
+func (f Foo) Sum(args Args, reply *int) error {
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
 func main() {
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
 
@@ -20,19 +32,7 @@ func main() {
 	}
 	defer func() { _ = client.Close() }()
 
-	//conn, err := net.Dial("tcp", <-addr)
-	//defer func() { _ = conn.Close() }()
-	//if err != nil {
-	//	log.Println("rpc client: net.Dial() failed, error: ", err)
-	//	return
-	//}
-
 	time.Sleep(time.Second)
-	// 正如设计的一样，客户端固定采用JSON编码Option，后续的 header 和 body 的编码方式由 Option 中的 CodeType 指定
-	//_ = json.NewEncoder(conn).Encode(wangRPC.DefaultOption)
-
-	// 调用NewCodecFunc函数得到对应的实现了Codec接口的实例
-	//cc := codec.NewGobCodec(conn)
 
 	var wg sync.WaitGroup
 	// send request and receive response
@@ -40,32 +40,27 @@ func main() {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			args := fmt.Sprintf("wangrpc req %d", n)
-			var reply string
+			args := &Args{
+				Num1: n,
+				Num2: n * n,
+			}
+			var reply int
 			err2 := client.Call("Foo.Sum", args, &reply)
 			if err2 != nil {
 				log.Fatal("call Foo.Sum error: ", err2)
 			}
-			log.Println("reply: ", reply)
+			log.Printf("reply: %d + %d = %d: ", args.Num1, args.Num2, reply)
 		}(i)
-
-		//h := &codec.Header{
-		//	ServiceMethod: "Foo.Sum",
-		//	Seq:           uint64(i),
-		//}
-		//// 向服务端发送数据
-		//_ = cc.Write(h, fmt.Sprintf("wangrpc req %d", h.Seq))
-		//
-		//// 从服务端接收响应数据 (包括header和body)
-		//_ = cc.ReadHeader(h)
-		//var reply string
-		//_ = cc.ReadBody(&reply)
-		//log.Println("reply: ", reply)
 	}
 	wg.Wait()
 }
 
 func startServer(addr chan string) {
+	var foo Foo
+	if err2 := wangRPC.Register(&foo); err2 != nil {
+		log.Fatal("register error: ", err2)
+	}
+
 	// pick a free port
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
