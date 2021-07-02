@@ -4,12 +4,14 @@ import (
 	"7go/wangRPC/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 通信报文格式
@@ -19,13 +21,16 @@ import (
 const MagicNumber = 0x3bef55c
 
 type Option struct {
-	MagicNumber int         // MagicNumber marks this's a wangrpc request
-	CodecType   codec.Type  // client may choose different Codec to encode body
+	MagicNumber    int         // MagicNumber marks this's a wangrpc request
+	CodecType      codec.Type  // client may choose different Codec to encode and decode body
+	ConnectTimeout time.Duration  // 0 means no limit
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
 	MagicNumber: MagicNumber,
 	CodecType:   codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 
@@ -116,7 +121,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 	// 调用NewCodecFunc函数得到对应的实现了Codec接口的实例
 	cc := f(conn)
-	s.serveCodec(cc)
+	s.serveCodec(cc, &opt)
 }
 
 
@@ -130,7 +135,7 @@ type request struct {
 	svc          *service
 }
 
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)  // make sure to send a complete response
 	wg      := new(sync.WaitGroup)  // wait until all request are handled
 
@@ -148,7 +153,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 		}
 
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 }
 
@@ -205,16 +210,38 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+
+	// 这里需要确保 sendResponse()仅调用一次，因此将整个过程拆分为 called 和 sent 两个阶段
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
 
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 

@@ -2,6 +2,7 @@ package wangRPC
 
 import (
 	"7go/wangRPC/codec"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type ReqNo uint64
@@ -106,9 +108,15 @@ func (client *Client) terminateCalls(err error) {
 }
 
 // Call()是对Go()的一个封装，阻塞在call.Done这等待响应返回，是个同步接口
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
 
 // Go()和Call()是客户端暴露给用户的两个RPC服务调用接口
@@ -191,6 +199,13 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	// 根据CodecType获取对应的NewCodecFunc函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
@@ -244,23 +259,79 @@ func parseOptions(opts ...*Option) (*Option, error)  {
 }
 
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
+}
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() {
-		if client == nil {
+		if client == nil || err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+
+	ch := make(chan clientResult)
+	// 新建一个协程执行NewClient()，执行完成后则通过chan发送结果
+	go func() {
+		client2, err2 := f(conn, opt)
+		ch <- clientResult{
+			client: client2,
+			err:    err2,
+		}
+	}()
+
+	// 没有超时限制
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+
+	// 设置超时限制，如果指定的时间内没有从chan中收到NewClient()的结果则当作超时处理
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
