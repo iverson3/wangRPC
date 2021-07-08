@@ -2,6 +2,7 @@ package wangRPC
 
 import (
 	"7go/wangRPC/codec"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -304,6 +307,41 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 	}
 }
 
+// 先用HTTP协议完成了一个握手的过程，然后再使用自己定义的协议来进行双方的通讯
+func NewHTTPClient(conn net.Conn, opt *Option) (client *Client, err error) {
+	// 发送CONNECT HTTP请求
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+	// 获取HTTP请求的响应结果
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	// 通过HTTP CONNECT请求建立连接之后，后续的通信过程就交给NewClient()
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client error: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
+}
 
 
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -244,15 +245,63 @@ func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex
 	}
 }
 
+const (
+	connected        = "200 Connected to Wang RPC"
+	defaultRPCPath   = "/_wangrpc_"       // CONNECT请求的http路径
+	defaultDebugPath = "/debug/wangrpc"   // DEBUG页面的地址
+)
+
+// 实现Handler接口
+// 处理客户端的HTTP CONNECT请求，完成握手过程
+// 并取出已建立的HTTP连接中的TCP以进行后续的RPC通信
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	// Hijack()可以将HTTP对应的TCP连接取出 (HTTP通信本就是基于TCP连接的)
+	// 连接在Hijack()之后，HTTP的相关操作就会受到影响，调用方需要负责去关闭连接 (不再遵守http协议)
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+
+	// 发送HTTP响应数据给客户端
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	// 后续则使用建立的tcp连接正常处理rpc请求
+	s.ServeConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+
+	// 将debugHTTP实例绑定到地址 defaultDebugPath
+	http.Handle(defaultDebugPath, debugHTTP{s})
+	log.Println("rpc server debug path: ", defaultDebugPath)
+}
+
+func HandleHTTP()  {
+	DefaultServer.HandleHTTP()
+}
 
 
 
+// https://liqiang.io/post/hijack-in-go
+// https://www.jianshu.com/p/c0c8cec369fd
+// https://blog.csdn.net/ya_feng/article/details/104354690
+// Hijack()方法，一般在创建连接阶段使用HTTP连接，后续自己完全处理Connection (不再遵守http协议)
+// 符合这样的使用场景并不多:
+// 1.基于HTTP协议的rpc算一个
+// 2.从HTTP升级到WebSocket也算一个
 
 
-
-
-
-
+// conn, _, err := w.(http.Hijacker).Hijack()
+// 这是一段接管 HTTP 连接的代码
+// 所谓的接管HTTP连接是指这里接管了HTTP的TCP连接，也就是说Golang的内置HTTP库和HTTPServer库将不会再管理这个TCP连接的生命周期，其生命周期完全交给Hijacker来管理
 
 
 

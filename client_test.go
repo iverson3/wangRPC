@@ -3,6 +3,8 @@ package wangRPC
 import (
 	"context"
 	"net"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -67,7 +69,25 @@ func TestClient_Call(t *testing.T) {
 	})
 }
 
-
+// 该测试用例使用了 unix协议创建socket连接，适用于本机内部的通信，使用上与 TCP协议并无区别
+func TestXDial(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		ch := make(chan struct{})
+		addr := "/tmp/wangrpc.sock"
+		go func() {
+			_ = os.Remove(addr)
+			l, err := net.Listen("unix", addr)
+			if err != nil {
+				t.Fatal("failed to listen unix socket")
+			}
+			ch <- struct{}{}
+			Accept(l)
+		}()
+		<-ch
+		_, err := XDial("unix@" + addr)
+		_assert(err == nil, "failed to connect unix socket")
+	}
+}
 
 
 
